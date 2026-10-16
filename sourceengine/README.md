@@ -38,7 +38,7 @@ import { QuickJsDiagnostics } from '@legado/sourceengine/Diagnostics';
 | 书源运行时状态持久化 | 实现 `BookSourceRuntimePersistence`（读取书源、写回 `variable` / `loginHeader` / `loginInfo`），在启动时调用 `BookSourceRuntimeStore.install(...)`。不安装时读到 `null`，写入被跳过。 |
 | ArkWeb 宿主 | `BookSourceStageWebRuntime.get().attach(controller)`、`WebBookFetchRuntime` 需要页面里挂一个 `Web` 组件提供控制器；参考开源轻页的 [`BookSourceStageRuntimeHost.ets`](https://github.com/wip3l/legado-harmony/blob/main/entry/src/main/ets/components/BookSourceStageRuntimeHost.ets)、[`WebBookFetchRuntimeHost.ets`](https://github.com/wip3l/legado-harmony/blob/main/entry/src/main/ets/components/WebBookFetchRuntimeHost.ets)。 |
 | Context | `TlsTrustStore.load(context)`、`QuickJsDiagnostics.initialize(context)` 等 Preferences 存储需要传入应用上下文。 |
-| 网页验证 | 遇到验证页时 `VerificationSupport` 写入 AppStorage：`pendingVerificationUrl`、`pendingVerificationTitle`、`pendingVerificationTime`、`pendingVerificationSourceUrl`、`pendingVerificationLoginUrl`。宿主的验证页读取这些值。 |
+| 网页验证 | 遇到验证页时 `VerificationSupport` 写入 AppStorage：`pendingVerificationUrl`、`pendingVerificationTitle`、`pendingVerificationTime`、`pendingVerificationSourceUrl`、`pendingVerificationLoginUrl`、`pendingVerificationUserAgent`。宿主的验证页读取这些值，使用对应 User-Agent 打开验证资源。 |
 | QuickJS 诊断刷新 | 存储变化时更新 AppStorage 的 `quickJsMigrationRevision`、`quickJsValidationRevision`、`quickJsRegressionArtifactRevision`，界面可以监听这些值来刷新。 |
 
 ## 可选宿主端口
@@ -56,6 +56,7 @@ import { QuickJsDiagnostics } from '@legado/sourceengine/Diagnostics';
 | `web` | 网页会话租约，WebView 抓取与听书音频嗅探在租约内执行 | 直接执行 |
 | `state` | 按书源记录最近一次失败原因 | 写入 AppStorage 的 `bookSourceStageLastError` |
 | `diagnostics` | 接收分段耗时（HTTP 传输与首字节、限流等待、脚本拼装等） | 不记录，也不拼接耗时明细 |
+| `convertChinese(text, converterType)` | 为规则兼容层的 `java.t2s` / `java.s2t` 提供同步转换；方向 `1` 为繁转简、`2` 为简转繁，词典由宿主加载 | 原样返回文本 |
 
 `NativeSourceImport.importObject` / `toBookSource` 只做定义转换，不清缓存、不访问网络或数据库；应用内导入仍用 `NativeSourceService.importObject`，它会清掉该书源的缓存。原生书源的声明式缓存按“定义 + 请求头 + 登录头 + 登录信息”分开，所以只用 `NativeSourceImport` 换了定义也不会读到旧值；登录站点的 Cookie 不参与分区，网页登录与退出登录时各自清缓存。
 

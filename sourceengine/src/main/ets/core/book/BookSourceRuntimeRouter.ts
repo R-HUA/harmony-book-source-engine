@@ -138,7 +138,9 @@ export class BookSourceRuntimeRouter {
     // Require the complete browser API token. Prefixes such as fetchTabCount() are ordinary
     // source helper functions and must not be classified as unmanaged browser networking.
     report.usesUnmanagedNetwork = /\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\b/.test(executable);
-    report.requiresFullJs = /=>|\bnew\s+(?:Set|Map)\s*\(|\.(?:map|find|filter|reduce|forEach)\s*\(|`[^`]*\$\{|\btry\s*\{|\b(?:const|let|var)\s*\{/.test(executable) ||
+    report.requiresFullJs = report.needsDom || report.usesDynamicEval || report.usesPackages ||
+      /\borg\.jsoup\b|\b(?:while|do|switch)\b|\bjava\.(?:ajax|ajaxAll|post|connect)\s*\(/.test(executable) ||
+      /=>|\bnew\s+(?:Set|Map)\s*\(|\.(?:map|find|filter|reduce|forEach)\s*\(|`[^`]*\$\{|\btry\s*\{|\b(?:const|let|var)\s*\{/.test(executable) ||
       this.usesBinaryData(executable) || executable.length > 24 * 1024;
     for (const method of report.requiredJavaMethods) {
       if (this.EMULATED_JAVA_METHODS.includes(method)) {

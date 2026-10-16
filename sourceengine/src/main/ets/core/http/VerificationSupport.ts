@@ -35,7 +35,8 @@ export class VerificationSupport {
     // responses such as {"message":"...","status":"10003"} hides the real credential
     // problem and cannot repair it. Likewise Cloudflare 521 means its origin is unavailable,
     // not that the client has a challenge to complete.
-    if (this.isStructuredApiResponse(body) || statusCode === 521) {
+    if (this.isStructuredApiResponse(body) || statusCode === 0 ||
+      statusCode === 521 || statusCode === 522 || statusCode === 523 || statusCode === 524) {
       return false;
     }
     if (statusCode >= 200 && statusCode < 300 && this.looksLikeExpectedListResponse(source, body)) {
@@ -46,9 +47,6 @@ export class VerificationSupport {
     }
     if (this.isLoginGateResponse(source, body)) {
       return true;
-    }
-    if (statusCode === 0) {
-      return this.hasBrowserVerifyHint(source, rule || '') || this.hasLoginEntry(source);
     }
     if (!(statusCode === 401 || statusCode === 403 || statusCode === 429 || statusCode === 521 || statusCode === 522 || statusCode === 523 || statusCode === 524)) {
       return false;
@@ -81,7 +79,49 @@ export class VerificationSupport {
     if (source) {
       AppStorage.setOrCreate('pendingVerificationSourceUrl', source.bookSourceUrl || '');
       AppStorage.setOrCreate('pendingVerificationLoginUrl', this.resolveBookSourceLoginUrl(source));
+      AppStorage.setOrCreate('pendingVerificationUserAgent', this.staticSourceUserAgent(source));
+    } else {
+      // A verification request without a source must not inherit an earlier source's UA.
+      AppStorage.setOrCreate('pendingVerificationUserAgent', '');
     }
+  }
+
+  /**
+   * The literal User-Agent a source declares in `header`, or '' when it declares none.
+   *
+   * Only static headers are read: a `@js:`/`js:` header is computed per request and must not be
+   * guessed here. Sites commonly serve a different theme per User-Agent, so a verification or
+   * login page opened for a source that declares one has to present the same UA as its requests —
+   * otherwise the operator completes verification against a page the source itself never sees
+   * (for example the site's mobile theme with its own cookies).
+   */
+  static staticSourceUserAgent(source: BookSource): string {
+    const header = (source.header || '').trim();
+    if (!header || /^@?js:/i.test(header) || header.startsWith('<js>')) return '';
+    let entries: Record<string, string> = {};
+    if (header.startsWith('{') || header.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(header) as Object;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          entries = parsed as Record<string, string>;
+        }
+      } catch (_) {
+        return '';
+      }
+    } else {
+      for (const line of header.split(/\r?\n/)) {
+        const index = line.indexOf(':');
+        if (index <= 0) continue;
+        entries[line.substring(0, index).trim()] = line.substring(index + 1).trim();
+      }
+    }
+    for (const name of Object.keys(entries)) {
+      if (name.toLowerCase() !== 'user-agent') continue;
+      const value = String(entries[name] || '').trim();
+      // Guard against placeholder/script values reaching the Web component's UA.
+      return value && !value.includes('{{') && !/^@?js:/i.test(value) ? value : '';
+    }
+    return '';
   }
 
   static buildBookSourceLoginUrl(source: BookSource): string {
@@ -123,6 +163,7 @@ export class VerificationSupport {
     AppStorage.setOrCreate('pendingVerificationTitle', '');
     AppStorage.setOrCreate('pendingVerificationSourceUrl', '');
     AppStorage.setOrCreate('pendingVerificationLoginUrl', '');
+    AppStorage.setOrCreate('pendingVerificationUserAgent', '');
   }
 
   static getPendingUrl(): string {
@@ -145,7 +186,14 @@ export class VerificationSupport {
     return false;
   }
 
-  static pickVerificationUrl(source: BookSource, requestUrl: string, rule?: string): string {
+  static pickVerificationUrl(source: BookSource, requestUrl: string, rule?: string,
+    body: string = '', statusCode: number = -1): string {
+    // A browser challenge belongs to the failed resource, not the source's login form.
+    // Prefer the response URL (including redirects); request options are not part of a URL.
+    if (statusCode >= 0 && !this.isLoginGateResponse(source, body)) {
+      const target = this.cleanUrl(requestUrl).replace(/,\s*\{[\s\S]*$/, '');
+      if (this.isHttpUrl(target)) return target;
+    }
     const fromRule = this.pickStartBrowserUrl(rule || '') ||
       this.pickStartBrowserUrl(source.searchUrl || '') ||
       this.pickStartBrowserUrl(source.bookInfoRule?.init || '') ||

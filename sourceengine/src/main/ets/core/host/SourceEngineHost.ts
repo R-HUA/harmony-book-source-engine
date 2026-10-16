@@ -75,6 +75,8 @@ export interface SourceEngineHostAdapter {
   requests?: SourceRequestScheduler;
   state?: SourceExecutionState;
   diagnostics?: SourceDiagnostics;
+  /** 简繁转换由宿主提供词典；方向 1 为繁转简、2 为简转繁。 */
+  convertChinese?: (text: string, converterType: number) => string;
 }
 
 class DefaultRateWaiter implements SourceRateWaiter {
@@ -121,6 +123,11 @@ export class SourceEngineHost {
 
   static scriptExecutor(): SourceScriptExecutor | undefined {
     return SourceEngineHost.adapter.scripts;
+  }
+
+  static convertChinese(text: string, converterType: number): string {
+    const converter = SourceEngineHost.adapter.convertChinese;
+    return converter ? converter(text, converterType) : text;
   }
 
   static async evaluate(script: string, sourceUrl: string, timingId: number = 0): Promise<string> {

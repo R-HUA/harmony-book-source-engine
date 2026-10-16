@@ -49,7 +49,7 @@ export class BookFieldSanitizer {
     const text = (value || '').trim();
     if (!text) return true;
     if (/^(?:undefined|null)$/i.test(text)) return true;
-    return text.includes('{{') || text.includes('}}') || text.includes('@js:') || text.includes('java.') ||
+    return text.includes('{{') || text.includes('}}') || /@(?:js|css|xpath|json):/i.test(text) || text.includes('java.') ||
       text.includes('result.replace') || /(^|[^\w])\$\.\.?[A-Za-z_]/.test(text);
   }
 }

@@ -20,6 +20,7 @@ export class BookSourceDebugNetworkTrace {
   bodyPreview: string = '';
   elapsedMs: number = 0;
   error: string = '';
+  cookieNames: string[] = [];
 }
 
 export class BookSourceDebugRuleTrace {
