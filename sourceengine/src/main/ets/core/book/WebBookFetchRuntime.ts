@@ -67,6 +67,25 @@ class WebBookFetchTask {
   webJsAttempts: number = 0;
   /** Bumped per webJs run so callbacks of a superseded run (page navigated, retry) are ignored. */
   webJsRun: number = 0;
+  /** First wall-clock budget: by then the challenge has either solved (navigation) or is returned. */
+  challengeDeadlineAt: number = -1;
+  /** Absolute bound so a page that keeps navigating can never hold the shared host forever. */
+  challengeHardDeadlineAt: number = -1;
+  /** Last challenge page captured, returned only when the wait budget is exhausted. */
+  lastChallengeUrl: string = '';
+  lastChallengeHtml: string = '';
+}
+
+/** One mounted hidden host plus the User-Agent state the runtime installed on its controller. */
+class WebBookFetchHost {
+  controller: webview.WebviewController;
+  appliedUserAgent: string = '';
+  defaultUserAgentValue: string = '';
+
+  constructor(controller: webview.WebviewController, defaultUserAgentValue: string) {
+    this.controller = controller;
+    this.defaultUserAgentValue = defaultUserAgentValue;
+  }
 }
 
 /**
@@ -85,6 +104,12 @@ export class WebBookFetchRuntime {
   private documentSequence: number = 0;
   private active: WebBookFetchTask | null = null;
   private queue: WebBookFetchTask[] = [];
+  private appliedUserAgent: string = '';
+  private defaultUserAgentValue: string = '';
+  /** 按最近挂载顺序保存宿主，顶层页面退出后恢复仍挂载的页面宿主。 */
+  private hosts: WebBookFetchHost[] = [];
+  private static readonly CHALLENGE_WAIT_MS = 12000;
+  private static readonly CHALLENGE_HARD_LIMIT_MS = 30000;
 
   static get(): WebBookFetchRuntime {
     if (!WebBookFetchRuntime.instance) WebBookFetchRuntime.instance = new WebBookFetchRuntime();
@@ -94,8 +119,18 @@ export class WebBookFetchRuntime {
   attach(controller: webview.WebviewController): void {
     this.controllers = this.controllers.filter((item: webview.WebviewController): boolean => item !== controller);
     this.controllers.push(controller);
+    const known = this.findHost(controller);
+    const host = known ? known : new WebBookFetchHost(controller, this.readControllerUserAgent(controller));
+    if (known) {
+      this.hosts = this.hosts.filter((item: WebBookFetchHost): boolean => item !== host);
+    }
+    // Read the controller's default UA before installing a source's custom value.
+    this.hosts.push(host);
     if (this.controller === controller) {
+      this.adoptHost(host);
+      this.ready = true;
       this.recoverIdleController();
+      this.runNext();
       return;
     }
     // A routed page can attach its host before the previous page has disappeared. Preserve the
@@ -124,12 +159,14 @@ export class WebBookFetchRuntime {
     this.controller = controller;
     // onControllerAttached means loadUrl/postUrl are already usable. Waiting for the initial
     // about:blank onPageEnd introduces a cold-start race and is unnecessary for this transport.
+    this.adoptHost(host);
     this.ready = true;
     this.runNext();
   }
 
   detach(controller: webview.WebviewController): void {
     this.controllers = this.controllers.filter((item: webview.WebviewController): boolean => item !== controller);
+    this.hosts = this.hosts.filter((host: WebBookFetchHost): boolean => host.controller !== controller);
     if (this.controller !== controller) return;
     const previous = this.controllers[this.controllers.length - 1];
     if (previous) {
@@ -146,6 +183,19 @@ export class WebBookFetchRuntime {
     this.controller = null;
     this.ready = false;
   }
+
+  private findHost(controller: webview.WebviewController): WebBookFetchHost | null {
+    for (const host of this.hosts) {
+      if (host.controller === controller) return host;
+    }
+    return null;
+  }
+
+  private adoptHost(host: WebBookFetchHost): void {
+    this.appliedUserAgent = host.appliedUserAgent;
+    this.defaultUserAgentValue = host.defaultUserAgentValue;
+  }
+
 
   setReady(ready: boolean, controller: webview.WebviewController): void {
     if (this.controller !== controller) return;
@@ -223,6 +273,10 @@ export class WebBookFetchRuntime {
       if (cancelled && cancelled()) return false;
       await new Promise<void>((resolve) => setTimeout(resolve, 50));
       if (this.isAttached()) return true;
+    }
+    if (!this.isAttached()) {
+      console.warn(`[WebBookFetch] 等待隐藏宿主超时：已注册 ${this.hosts.length} 个，` +
+        `当前页面是否挂载了 WebBookFetchRuntimeHost`);
     }
     return this.isAttached();
   }
@@ -386,8 +440,7 @@ export class WebBookFetchRuntime {
       return;
     }
     try {
-      const userAgent = this.headerValue(task.request.headers, 'user-agent');
-      if (userAgent) this.controller.setCustomUserAgent(userAgent);
+      this.applyUserAgent(this.headerValue(task.request.headers, 'user-agent'));
       const cookie = this.headerValue(task.request.headers, 'cookie');
       if (cookie) CookieStore.forSource(task.request.cookieSource).setCookies(task.request.url, cookie);
       if (String(task.request.method || 'GET').toUpperCase() === 'POST') {
@@ -398,6 +451,38 @@ export class WebBookFetchRuntime {
       }
     } catch (error) {
       this.finishActive(this.failure(task.request.url, this.errorMessage(error as Object)));
+    }
+  }
+
+  /**
+   * Applies the request's User-Agent, or restores the value the controller had before this runtime
+   * touched it when the request declares none. Without this a desktop UA installed for one source
+   * would leak into every later `webView` request on the shared controller, and sources that never
+   * declared a UA would suddenly be served a different theme.
+   */
+  private applyUserAgent(userAgent: string): void {
+    const controller = this.controller;
+    if (!controller) return;
+    const wanted = userAgent || this.defaultUserAgentValue;
+    if (!wanted || wanted === this.appliedUserAgent) return;
+    try {
+      controller.setCustomUserAgent(wanted);
+      this.appliedUserAgent = wanted;
+      const host = this.findHost(controller);
+      if (host) host.appliedUserAgent = wanted;
+    } catch (error) {
+      console.warn('[WebBookFetch] setCustomUserAgent failed:', this.errorMessage(error as Object));
+    }
+  }
+
+  private readControllerUserAgent(controller: webview.WebviewController): string {
+    try {
+      // Read on attach, strictly before any custom UA is installed on this controller, so the
+      // captured value is the ArkWeb platform default rather than some other source's UA.
+      return controller.getUserAgent() || '';
+    } catch (error) {
+      console.warn('[WebBookFetch] getUserAgent unavailable:', this.errorMessage(error as Object));
+      return '';
     }
   }
 
@@ -444,6 +529,13 @@ export class WebBookFetchRuntime {
       task.snapshot = html.substring(0, 65536);
       task.snapshotTruncated = task.snapshot.length < html.length;
       task.snapshotUrl = snapshotUrl;
+      // Challenge pages keep their own URL while the site script is still deciding; the real page
+      // arrives as a later navigation. Never let the stability rule return the challenge itself
+      // while it still has a chance to complete.
+      if (this.looksLikeBrowserChallenge(String(snapshot['title'] || ''), html)) {
+        this.holdActiveForChallenge(task, snapshotUrl, html);
+        return;
+      }
       if (task.request.webWaitFor && task.earlyProbeSafe &&
         (snapshot['ready'] === 'interactive' || snapshot['ready'] === 'complete')) {
         this.resolveBody(task, snapshotUrl, html);
@@ -464,6 +556,65 @@ export class WebBookFetchRuntime {
         this.finishActive(this.failure(task.request.url, this.errorMessage(error)));
       }
     });
+  }
+
+  /**
+   * A challenge page is not a response yet: the site's script needs the page (and its cookies)
+   * to keep running, then reloads the very same URL with the real content. While that is pending
+   * the task must neither resolve (the challenge body would look like a final answer) nor time
+   * out (a status-0 failure is deliberately ignored by stage verification).
+   */
+  private holdActiveForChallenge(task: WebBookFetchTask, url: string, html: string): void {
+    if (this.active !== task) return;
+    task.lastChallengeUrl = url;
+    task.lastChallengeHtml = html;
+    task.stableCount = 0;
+    task.lastSignature = '';
+    if (task.challengeDeadlineAt < 0) {
+      const now = Date.now();
+      task.challengeDeadlineAt = now + WebBookFetchRuntime.CHALLENGE_WAIT_MS;
+      task.challengeHardDeadlineAt = now + WebBookFetchRuntime.CHALLENGE_HARD_LIMIT_MS;
+      // Re-arm the request timeout past the hard deadline; the inspect loop below normally
+      // finishes the wait much earlier. If this backstop ever fires, still hand back the last
+      // captured challenge page so the verification prompt has something to work with.
+      if (task.timeoutId >= 0) clearTimeout(task.timeoutId);
+      task.timeoutId = setTimeout((): void => {
+        if (this.active !== task) return;
+        const body = task.lastChallengeHtml;
+        if (body) this.finishActive(this.success(task.lastChallengeUrl || task.request.url, body));
+        else this.finishActive(this.failure(task.request.url, 'WebView 请求超时（等待网页验证）'));
+      }, Math.max(1000, task.challengeHardDeadlineAt + 2000 - Date.now()));
+    }
+    if (!task.pageEnded) {
+      // A navigation is already in flight — most likely the challenge just completed. Give that
+      // page the floor while the hard deadline bounds possible redirect loops.
+      if (Date.now() >= task.challengeHardDeadlineAt) {
+        this.finishActive(this.success(url, html));
+        return;
+      }
+      this.scheduleInspect(task, 500);
+      return;
+    }
+    if (Date.now() >= task.challengeDeadlineAt) {
+      // Wait budget exhausted and the page is still parked on the challenge: return it so the
+      // stage layer can raise the visible browser-verification prompt.
+      this.finishActive(this.success(url, html));
+      return;
+    }
+    this.scheduleInspect(task, 500);
+  }
+
+  /**
+   * Mirrors the distinctive markers of VerificationSupport.isChallengeResponse(), kept local so
+   * this transport stays dependency-free. A page that merely mentions Cloudflare in passing must
+   * not be delayed, so only unambiguous challenge fingerprints are listed.
+   */
+  private looksLikeBrowserChallenge(title: string, html: string): boolean {
+    const sample = `${title || ''}\n${(html || '').substring(0, 4000)}`;
+    return sample.includes('Just a moment') || sample.includes('challenge-platform') ||
+      sample.includes('_cf_chl') || sample.includes('cf_chl_opt') || sample.includes('cf-challenge') ||
+      sample.includes('challenges.cloudflare.com') || sample.includes('Verifying you are human') ||
+      sample.includes('确认您是真人') || sample.includes('正在验证您是否是真人');
   }
 
   private resolveBody(task: WebBookFetchTask, finalUrl: string, html: string): void {

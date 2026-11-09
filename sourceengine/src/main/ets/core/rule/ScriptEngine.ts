@@ -575,7 +575,7 @@ class ArkTsJsRunner {
       'java.md5Encode32', 'java.md5Encode', 'java.sha1Encode', 'java.sha256Encode', 'java.sha512Encode',
       'java.urlEncode', 'java.urlDecode', 'java.encodeURI', 'java.htmlEncode', 'java.htmlDecode',
       'java.getCookie', 'java.timeFormat', 'java.timeFormatUTC',
-      'java.getString', 'java.getElement', 'java.t2s', 'java.androidId',
+      'java.getString', 'java.getElement', 'java.t2s', 'java.s2t', 'java.androidId',
       'java.randomUUID', 'java.aesBase64DecodeToString', 'java.aesEncodeToBase64String',
       'java.desBase64DecodeToString', 'java.desEncodeToBase64String'
     ].includes(name);

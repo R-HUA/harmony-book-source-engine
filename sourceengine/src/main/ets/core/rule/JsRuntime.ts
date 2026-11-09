@@ -1,7 +1,7 @@
 import { util } from '@kit.ArkTS';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { CookieStore } from '../http/CookieStore';
-import { SourceCookieJar } from '../host/SourceEngineHost';
+import { SourceCookieJar, SourceEngineHost } from '../host/SourceEngineHost';
 import { JsonPathEvaluator } from './JsonPathEvaluator';
 import { QuickJsScriptRuntime } from '../script/QuickJsScriptRuntime';
 
@@ -40,6 +40,9 @@ export class JsRuntime {
   private evalExpr(expr: string): string {
     const originalExpr = expr;
     try {
+      // A bound token is already a value. Do not turn it into a quoted JS fragment and
+      // invoke the optional native engine just to unwrap it (notably URL {{key}} templates).
+      if (Object.prototype.hasOwnProperty.call(this.vars, expr)) return this.vars[expr];
       const statements = this.splitStatements(expr);
       if (statements.length > 1) {
         let last = '';
@@ -106,7 +109,10 @@ export class JsRuntime {
         (v: string) => this.timeFormatCall(v, false));
       expr = this.replaceFunctionCalls(expr, 'java.put', (v: string) => this.putVar(v));
       expr = this.replaceFunctionCalls(expr, 'java.get', (v: string) => this.getVarCall(v));
-      expr = this.replaceFunctionCalls(expr, 'java.t2s', (v: string) => this.evalStr(v));
+      expr = this.replaceFunctionCalls(expr, 'java.t2s',
+        (v: string) => SourceEngineHost.convertChinese(this.evalStr(v), 1));
+      expr = this.replaceFunctionCalls(expr, 'java.s2t',
+        (v: string) => SourceEngineHost.convertChinese(this.evalStr(v), 2));
       // All java.* value shims have run by this point, so a remaining `String("…").replace(…)`
       // chain is plain JavaScript over quoted literals. Evaluate it natively BEFORE the String
       // shim runs: that shim strips quotes eagerly and would corrupt the surrounding expression

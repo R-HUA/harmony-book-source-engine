@@ -58,6 +58,7 @@
 | `web` | 网页会话租约，WebView 抓取与听书音频嗅探在租约内执行 | 直接执行 |
 | `state` | 按书源记录最近一次失败原因 | 写入 AppStorage 的 `bookSourceStageLastError` |
 | `diagnostics` | 接收分段耗时（HTTP 传输与首字节、限流等待、脚本拼装等） | 不记录，也不拼接耗时明细 |
+| `convertChinese(text, converterType)` | 为规则兼容层的 `java.t2s` / `java.s2t` 提供同步转换；方向 `1` 为繁转简、`2` 为简转繁，词典由宿主加载 | 原样返回文本 |
 
 `SourceEngineHost.setReaderImagesDeferred(source, true)` 不是端口，而是宿主对单个书源实例的开关：打开后正文辅助层先返回完整的图片标记，图片的下载、解密和重排由宿主按需逐张完成（见书源开发文档“图片清单与按需加载”）。它只能由宿主代码调用，不暴露给书源规则。
 

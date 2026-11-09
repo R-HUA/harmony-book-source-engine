@@ -80,8 +80,11 @@ export class QuickJsScriptRuntime {
     const options = new JSRuntimeOptions();
     options.memoryLimitBytes = 16 * 1024 * 1024;
     options.stackLimitBytes = 512 * 1024;
-    const context = new JSContext(options);
+    let context: JSContext | null = null;
     try {
+      // Engine creation itself may fail when the native runtime is unavailable. Keep that
+      // failure inside the fallback boundary, just like evaluation and binding failures.
+      context = new JSContext(options);
       context.setObject(variables, '__legadoBindings');
       const wrapped = `(function(){const __bindings=globalThis.__legadoBindings;` +
         `${declarations.join(';')};return (${code});})()`;
@@ -91,7 +94,9 @@ export class QuickJsScriptRuntime {
     } catch (error) {
       output.error = QuickJsScriptRuntime.errorMessage(error);
     } finally {
-      context.release();
+      if (context !== null) {
+        try { context.release(); } catch (_) {}
+      }
     }
     return output;
   }

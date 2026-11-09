@@ -35,6 +35,7 @@ export class StageWebRuntimeRequest {
    * Callers that send a generated wrapper whose own value is always explicit can turn it off.
    */
   rhinoCompletion: boolean = true;
+  maxReplaySteps: number = 20;
   stage: string = SourceRuntimeStage.URL;
   ownerId: string = '';
   debugContext: BookSourceDebugContext | null = null;
@@ -65,7 +66,9 @@ export class StageWebRuntimeRequest {
       this.maxResponseBytes = 4 * 1024 * 1024;
       this.maxTotalResponseBytes = 8 * 1024 * 1024;
       this.maxInputBytes = 16 * 1024 * 1024;
-      this.maxRequestCount = 8;
+      // Catalogs may fetch several pages per volume; retain finite per-stage limits.
+      this.maxRequestCount = 512;
+      this.maxReplaySteps = 576;
     } else if (this.stage === SourceRuntimeStage.CONTENT ||
       this.stage === SourceRuntimeStage.READER_ACTION) {
       this.maxResponseBytes = 6 * 1024 * 1024;
@@ -508,7 +511,8 @@ export class BookSourceStageWebRuntime {
     // requests (a source fetching several categories/tabs) are bounded separately.
     const issuedSpecs: Record<string, number> = {};
     const stageCode = await this.prepareStageCode(request);
-    for (let stepIndex = 0; stepIndex < 20; stepIndex++) {
+    const replayLimit = Math.max(20, Math.min(request.maxReplaySteps, 576));
+    for (let stepIndex = 0; stepIndex < replayLimit; stepIndex++) {
       this.ensureNotCancelled(request);
       const timingId = SourceEngineHost.id(request.source);
       const buildStartedAt = Date.now();
@@ -583,10 +587,10 @@ export class BookSourceStageWebRuntime {
         issuedSpecs[spec] = (issuedSpecs[spec] || 0) + 1;
         const repeatCount = issuedSpecs[spec];
         requestCount++;
-        // Distinct legitimate requests are allowed up to a hard ceiling tied to the 20-pass
-        // replay limit; reissuing the SAME spec repeatedly (cached response never consumed)
+        // Distinct legitimate requests use a stage-specific ceiling; reissuing the SAME
+        // spec repeatedly (cached response never consumed)
         // trips the tighter runaway threshold regardless of budget.
-        const distinctLimit = Math.max(request.maxRequestCount || 12, 16);
+        const distinctLimit = Math.min(512, Math.max(request.maxRequestCount || 12, 16));
         const repeatLimit = Math.max(1, Math.min(request.maxRequestCount || 12, 12));
         console.info('[StageWebRuntime] fetch #' + requestCount +
           ' step=' + stepIndex + (reissued ? ' reissue=' + repeatCount : '') +
@@ -1211,7 +1215,8 @@ export class BookSourceStageWebRuntime {
       `return list.map(function(item){return elementFromHtml(item);});}` +
       `const cookieData=Object.assign({},S.cookies||{});const cookie={getCookie:function(k){k=String(k??'');` +
       `if(Object.prototype.hasOwnProperty.call(cookieData,k))return cookieData[k]??'';if(!pendingCookie)pendingCookie=k;return '';},` +
-      `getKey:function(k,n){const v=this.getCookie(k);const m=String(v).match(new RegExp('(?:^|;\\\\s*)'+n+'=([^;]*)'));return m?m[1]:'';},` +
+      `getKey:function(k,n){const parts=String(this.getCookie(k)).split(';');n=String(n);` +
+      `for(const part of parts){const i=part.indexOf('=');if(i>=0&&part.slice(0,i).trim()===n)return part.slice(i+1).trim();}return '';},` +
       `setCookie:function(k,v){k=String(k??'');v=String(v??'');cookieData[k]=v;cookieOps.push({operation:'set',url:k,value:v,name:''});return v;},` +
       `replaceCookie:function(k,v){k=String(k??'');v=String(v??'');cookieData[k]=v;cookieOps.push({operation:'replace',url:k,value:v,name:''});return v;},` +
       `removeCookie:function(k,n){k=String(k??'');n=String(n??'');cookieOps.push({operation:'remove',url:k,value:'',name:n});` +
@@ -1357,7 +1362,21 @@ export class BookSourceStageWebRuntime {
       // marked speculative; the native side only delivers the settled prefix (see deliverSearchBatches).
       `emitSearch:function(v){searchBatches.push({text:text(v),speculative:!!(pending||pendingCookie||pendingCrypto||pendingStringRules.length)});return true;},` +
       `refreshContent:function(){return true;},upConfig:function(){return true;},searchBook:function(){return true;}};` +
-      `function TimeoutCancellationException(){}const Packages={io:{legato:{kazusa:{utils:{` +
+      // Jsoup collection operations share one detached DOM: remove() must affect parent selections.
+      // Parse source HTML without executing page scripts or attaching it to the host document.
+      `function jsoupElements(nodes){const list=Array.from(nodes||[]);return {` +
+      `select:function(q){const found=[];for(const n of list){if(n.nodeType===1&&n.matches(String(q)))found.push(n);` +
+      `if(n.querySelectorAll)for(const e of n.querySelectorAll(String(q)))if(found.indexOf(e)<0)found.push(e);}return jsoupElements(found);},` +
+      `remove:function(){for(const n of list)n.remove();return this;},` +
+      `eachText:function(){return list.map(function(n){return String(n.textContent||'').replace(/\\s+/g,' ').trim();});},` +
+      `text:function(){return this.eachText().join(' ');},size:function(){return list.length;},` +
+      `get:function(i){return jsoupElements([list[Number(i)]]);},` +
+      `attr:function(k){return list.length&&list[0].getAttribute?list[0].getAttribute(String(k))||'':'';},` +
+      `toString:function(){return list.map(function(n){return n.outerHTML||'';}).join('\\n');}};}` +
+      `const org={jsoup:{Jsoup:{parse:function(h){if(typeof DOMParser==='undefined')throw new Error('Jsoup桥接需要DOMParser');` +
+      `return jsoupElements([new DOMParser().parseFromString(String(h??''),'text/html')]);}}}};` +
+      `globalThis.org=org;` +
+      `function TimeoutCancellationException(){}const Packages={org:org,io:{legato:{kazusa:{utils:{` +
       `TimeoutCancellationException:TimeoutCancellationException}}}}};` +
       `function JavaImporter(){return {importClass:function(){return true;},importPackage:function(){return true;}};}` +
       `function importClass(){return true;}function importPackage(){return true;}` +

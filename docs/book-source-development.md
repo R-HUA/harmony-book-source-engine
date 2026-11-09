@@ -2707,6 +2707,31 @@ span!0@text
 
 选择器解析由项目内轻量解析器完成，并非完整浏览器 DOM/CSS 引擎。不要依赖复杂嵌套伪类、`an+b` 形式的 `nth-child`、伪元素或现代 CSS 全集。单个 HTML 响应超过 4 MiB 时，列表 CSS/正则解析会受保护性限制；大接口优先使用 JSONPath 或缩小响应。
 
+#### `@css:` 前缀：本项目的写法比 Android 阅读宽松
+
+Android 阅读只在**整条规则最前面**识别一次 `@css:` 前缀，剥掉后把剩下的整串按 `&&` / `||` / `%%` 切分，每一段都按 CSS 取值。因此跨段共用前缀是正确写法，重复前缀是错的：
+
+```text
+@css:.tit a@href||.read-btn@href      正确：@css: 只写一次，两段都是 CSS
+@css:.tit a@href||@css:.read-btn@href 错误：第二段的 @css: 被当成选择器，jsoup 抛
+                                      Could not parse query '@css:.read-btn'
+```
+
+标量 CSS 规则里缺 `@取值` 的分支会抛 `StringIndexOutOfBoundsException`；而 `bookList` / `chapterList` 这类元素列表字段在 CSS 模式下整段都是选择器，整段都不能出现 `@`。
+
+需要“第 N 个元素”时不要写成 CSS 索引——Android 的 `.N` / `!N` / `[N]` 索引**只在 Default 模式解析**，写在 `@css:` 选择器里会被 jsoup 当成 `class="0"` 之类的字面量，静默取空：
+
+```text
+@css:.bookinfo a.0@text        错误：CSS 模式不解析索引，取不到内容且不报错
+class.bookinfo@tag.a.0@text    正确：Default 语法的索引写在选择器段结尾
+```
+
+本项目解析器对上述错误写法更宽容，导入与本地调试都不会报错，但书源在 Android 阅读上会失败。发布或互导前用上游语义自查；在开源轻页工程根目录可运行：
+
+```bash
+node scripts/legado-rule-grammar-check.mjs <书源.json>
+```
+
 ### 基础 XPath
 
 支持一部分可转换为 CSS 的 XPath：

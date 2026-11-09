@@ -549,6 +549,19 @@ export class AnalyzeUrl {
     const resp = await this.fetchWithRetry(req);
     if (this.retryPolicy || this.isUsableResponse(resp)) return resp;
 
+    // A browser challenge (Cloudflare human check, login gate) that the native stack received can
+    // still be cleared by the already isolated WebView transport: it runs the site's challenge
+    // script and shares this request's cookie jar (WebCookieManager). Retry such a GET through it
+    // once — this is what lets a plain detail-page URL typed by the user behave like every other
+    // stage without any extra URL options. When even the browser cannot clear the challenge, the
+    // response it produced still reaches the stage layer, which raises the verification prompt.
+    if (this.shouldRetryChallengeWithWebView(req, resp)) {
+      console.info('[AnalyzeUrl] browser challenge received; retrying with WebView:', this.urlHost(req.url));
+      if (req.cancelCheck && req.cancelCheck()) return this.notSentResponse(req, RateLimitAcquireResult.Cancelled);
+      const webResponse = await this.fetchFollowingRedirects({ ...req, useWebView: true });
+      if (this.isUsableResponse(webResponse)) return webResponse;
+    }
+
     // A small group of IIS/legacy hosts intermittently fail before HarmonyOS Network Kit can
     // produce an HTTP response (for example 2300003/2300056/2300999). The same URL remains
     // reachable from ArkWeb because it uses the browser network stack. Keep native HTTP as the
@@ -789,6 +802,19 @@ export class AnalyzeUrl {
     // A reader must not invent mirrors or silently downgrade HTTPS.  Alternate endpoints are
     // executed only when the imported source explicitly declares them in its own rule/script.
     return [];
+  }
+
+  /**
+   * True when the native response is a browser challenge/login gate that the WebView transport
+   * should try instead. Uses the same predicate the stage layer uses to raise its verification
+   * prompt, so this retry only preempts prompts that could not have been satisfied natively; the
+   * method is intentionally limited to body-less GET reads and skips URLs already on the browser.
+   */
+  private shouldRetryChallengeWithWebView(req: HttpRequest, resp: HttpResponse): boolean {
+    if (!this.source || req.useWebView) return false;
+    if (!/^https?:\/\//i.test(req.url || '')) return false;
+    if ((req.method || 'GET').toUpperCase() !== 'GET') return false;
+    return VerificationSupport.shouldRequestBrowserVerification(this.source, resp.body || '', resp.statusCode, '');
   }
 
   private shouldRetryWithWebView(req: HttpRequest, resp: HttpResponse): boolean {

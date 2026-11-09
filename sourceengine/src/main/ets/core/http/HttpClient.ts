@@ -237,10 +237,14 @@ export class HttpClient {
       trace.bodyPreview = response.body || '';
       trace.elapsedMs = Math.max(0, Date.now() - startedAt);
       trace.error = response.success ? '' : (response.error || 'request failed');
+      const cookie = this.findHeader(req.observedRequestHeaders || {}, 'cookie');
+      trace.cookieNames = cookie.split(';').map((pair: string): string => pair.split('=')[0].trim())
+        .filter((name: string): boolean => /^[A-Za-z0-9_.-]+$/.test(name));
       req.debugContext.addNetwork(trace);
     }
     return response;
   }
+
 
   private async executeInternal(req: HttpRequest): Promise<HttpResponse> {
     if (req.cancelCheck && req.cancelCheck()) return this.cancelledResponse(req);
