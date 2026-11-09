@@ -156,7 +156,13 @@ export class HttpClient {
     const remaining = req.deadlineAt - Date.now();
     if (remaining <= 0) return timedOut();
     return await new Promise<T>((resolve, reject): void => {
-      const timer = setTimeout((): void => resolve(timedOut()), remaining);
+      const timer = setTimeout((): void => {
+        // Timers may fire a millisecond before Date.now() reaches the deadline. Once the caller has
+        // received the timeout, pin the deadline to now so late work (e.g. a request that only now
+        // obtained the shared browser session) sees it as expired and does not send or navigate.
+        if (req.deadlineAt) req.deadlineAt = Math.min(req.deadlineAt, Date.now());
+        resolve(timedOut());
+      }, remaining);
       work().then((value: T): void => {
         clearTimeout(timer);
         // The Web runtime already enforces the same deadline and retains its last snapshot.
