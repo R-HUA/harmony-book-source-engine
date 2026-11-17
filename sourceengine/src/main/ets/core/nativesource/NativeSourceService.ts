@@ -549,17 +549,20 @@ export class NativeSourceService {
     }));
   }
 
-  static logout(source: BookSource): void {
+  /** 退出登录要逐个删站点 Cookie，走异步接口，不在界面线程上同步等网页内核。 */
+  static async logout(source: BookSource): Promise<void> {
     const login = NativeSourceService.loginSpec(source);
     if (!login) return;
     NativeSourceService.clearCache(source.bookSourceUrl);
     if (!login.url) return;
     const origin = /^https?:\/\/[^/?#]+/i.exec(login.url);
+    // “https://站点”和“https://站点/”读到的是同一组 Cookie，只删一次。
+    const urls: string[] = [login.url];
+    if (origin && origin[0] !== login.url.replace(/\/$/, '')) urls.push(origin[0]);
     const jar = CookieStore.forSource(source.bookSourceUrl);
-    jar.removeCookie(login.url);
-    if (origin) {
-      jar.removeCookie(origin[0]);
-      jar.removeCookie(`${origin[0]}/`);
+    for (const url of urls) {
+      if (jar.removeCookieAsync) await jar.removeCookieAsync(url);
+      else jar.removeCookie(url);
     }
     jar.saveAsync();
     NativeSourceService.clearCache(source.bookSourceUrl);
@@ -925,7 +928,7 @@ export class NativeSourceService {
     for (const comment of result.paragraphComments) {
       if (comment.line < 0 || comment.line >= lines.length) continue;
       lines[comment.line] += ReaderActionMarker.create(`段评 ${comment.count > 99 ? '99+' : comment.count}`,
-        comment.url, '段评');
+        comment.url, '段评', comment.preview || '', comment.likes || '');
     }
     for (const link of result.links) {
       // 请求按钮把渲染好的请求编进标记地址，点击时由 runReaderAction 取出执行。
@@ -935,7 +938,8 @@ export class NativeSourceService {
       if (button) lines.push('', button);
     }
     if (result.chapterCommentUrl) {
-      const tail = ReaderActionMarker.create('本章说', result.chapterCommentUrl, '本章说');
+      const tail = ReaderActionMarker.create('本章说', result.chapterCommentUrl, '本章说',
+        result.chapterCommentPreview || '', result.chapterCommentLikes || '');
       if (tail) lines.push('', tail);
     }
     return lines.join('\n');

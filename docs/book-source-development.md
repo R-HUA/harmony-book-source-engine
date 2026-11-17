@@ -667,6 +667,108 @@ span.0:5@text          只有两个数字时表示范围：第 0 到第 4 个
 
 `list` 和 `fields` 的写法与搜索相同。
 
+#### 发现页本地筛选与补页
+
+接口能按某个维度筛选时，把变量写进分类地址即可（见上面的[发现页的筛选](#发现-explore)）。接口不支持、只在列表里返回这个字段（字数、更新时间、评分等）时，只能取回来自己筛。表达式只看得到当前这一页，也不能写循环，所以要把发现阶段交给[脚本](#脚本阶段-script)。
+
+先弄清宿主怎么翻页：
+
+- 每翻一页，宿主都用新的 `ctx.page` 调一次函数。发现阶段没有 `nextUrl`，函数只负责回答“第几页有哪些书”，不用一次合并所有页。
+- 每页条数不固定，返回几条就显示几条。
+- 返回 0 条，或返回的书按 `bookUrl` 去重后全是已显示过的，宿主就认为到底了，不再往下翻。请求失败要抛错，这时界面提示失败、允许上滑重试；不要把失败当成空列表返回。
+
+所以本地筛选的要点只有一条：**接口还没到底时，不能返回空页**。一个接口页可能整页被筛掉，函数要接着往后取，直到有命中。接口页码和宿主页码不再一一对应，下一次从哪个接口页开始，用 `cache` 记下来：
+
+```json
+"vars": [
+  { "key": "words", "label": "字数", "options": ["不限", "50万以上", "100万以上"], "default": "不限", "filter": true },
+  { "key": "updated", "label": "更新", "options": ["不限", "7天内", "30天内"], "default": "不限", "filter": true }
+],
+"explore": {
+  "script": "explore",
+  "menus": [
+    { "title": "分类" },
+    { "title": "玄幻", "url": "list:cat=1&gender=1" },
+    { "title": "古言", "url": "list:cat=1&gender=2" },
+    { "title": "榜单" },
+    { "title": "热榜", "url": "once:rank=hot&gender=1" }
+  ],
+  "fields": { "name": "$.title", "author": "$.author", "wordCount": "$.words", "bookUrl": "= '/book/' + $.id" }
+}
+```
+
+```js
+var WORDS = { '50万以上': [500000, Infinity], '100万以上': [1000000, Infinity] };
+var DAYS = { '7天内': 7, '30天内': 30 };
+var SIZE = 50;    // 筛选时每个接口页取几条；先确认站点允许的上限，超出后有的站会截断或报错
+var ENOUGH = 10;  // 凑够这么多条就返回
+var SOFT = 3;     // 已有命中时，一次最多连取几个接口页
+var HARD = 12;    // 一条都没命中时，一次最多连取几个接口页；要小于请求数上限
+
+function fetchList(id, page, size) {
+  var res = http.get('/api/list?' + id + '&page=' + page + '&size=' + size);
+  if (!res.ok) throw new Error('请求失败 ' + res.status);
+  return res.json().data.list || [];
+}
+
+function toMs(t) { t = Number(t); return t > 0 && t < 1e11 ? t * 1000 : t; }
+
+function pass(b, v) {
+  var range = WORDS[v.words];
+  if (range) {
+    var w = Number(b.words);
+    if (!isFinite(w) || w < range[0] || w >= range[1]) return false;
+  }
+  var days = DAYS[v.updated];
+  if (days) {
+    var t = toMs(b.updatedAt);
+    if (!(t > 0)) return true;  // 这个入口不返回更新时间：不参与这一项筛选
+    if (Date.now() - t > days * 86400000) return false;
+  }
+  return true;
+}
+
+function explore(ctx) {
+  var v = ctx.vars;
+  var kind = ctx.url.split(':')[0], id = ctx.url.slice(kind.length + 1);
+  var filtering = !!(WORDS[v.words] || DAYS[v.updated]);
+
+  if (kind === 'once') {  // 接口忽略 page，每次都返回同一批
+    if (ctx.page > 1) return [];
+    var all = fetchList(id, 1, filtering ? SIZE : 20);
+    return filtering ? all.filter(function (b) { return pass(b, v); }) : all;
+  }
+  if (!filtering) return fetchList(id, ctx.page, 20);
+
+  var key = 'explore|' + ctx.url + '|' + v.words + '|' + v.updated + '|';
+  var p = ctx.page === 1 ? 1 : (cache.get(key + ctx.page) || (ctx.page - 1) * SOFT + 1);
+  var hits = [], used = 0;
+  while (used < HARD && hits.length < ENOUGH && !(hits.length > 0 && used >= SOFT)) {
+    var list = fetchList(id, p++, SIZE);
+    used++;
+    if (!list.length) return hits;  // 接口到底
+    list.forEach(function (b) { if (pass(b, v)) hits.push(b); });
+  }
+  cache.put(key + (ctx.page + 1), p, 3600);
+  return hits;
+}
+```
+
+几点说明：
+
+- **游标**：第 1 页总从接口第 1 页开始，之后每页的起点存在 `cache` 里，键包含分类标识和所有筛选值。缓存过期或应用重启后接着翻时取不到游标，就按 `(page - 1) × SOFT + 1` 估一个起点；估偏了可能跳过或重复几本，重复的宿主会去掉。不要用 `ceil(page × 每页条数 / SIZE)` 这类固定比例换算接口页码，筛选后两边的比例是变的，换算出来会整段漏书，或者返回空页让列表提前结束。
+- **连取上限**：`HARD` 次都没有命中时只能返回空页，列表就此结束。`HARD` 越大越不容易误停，但这一页也越慢，而且受脚本请求数限制（默认 30，`scriptLimits.requests` 最多 100，见[原生脚本排错](#原生脚本排错)）。命中很稀疏的筛选，可以先在接口侧缩小范围（例如按分类、按完结状态），再在本地筛剩下的维度。
+- **缺字段的条目**：同一个站点的不同入口，返回的字段常常不一样，例如只有分类列表带更新时间、榜单不带。按“取不到就不通过”来写，不带这个字段的入口在开启筛选后会永远是空的。上面的写法是放行，代价是用户选了“7 天内”仍可能看到更新时间未知的书。也可以只对带这个字段的入口显示筛选，写法见[发现页的筛选](#发现-explore)里的 `when`。必须筛的维度（例如字数）取不到时就不通过。
+- **时间单位**：接口给的时间戳可能是秒，也可能是毫秒，比较前先统一。`toMs` 和内置函数 `formatDate` 一样，小于 10^11 的值按秒处理。
+- **分类标识**：脚本发现阶段的分类 `url` 只是交给 `ctx.url` 的标识，凡是影响响应的参数都要写进去，不能只写主键。上例里男频和女频共用一套分类编号，漏掉 `gender` 时两个分类会请求同一个地址、显示同一批书；游标的缓存键也是用标识拼的，两个分类会共用一个游标。
+- **忽略 `page` 的入口**：榜单、推荐这类入口常常每次都返回同一批书。第 2 页起直接返回空页，可以省掉一次请求；开启筛选时，第 1 页就按最大条数取，一次筛完返回。
+
+验收时，静态检查和调试页的链路通过都证明不了筛选生效，至少再做三件事：
+
+1. 把 `pass` 单独拿出来，用构造的数组跑一遍，确认每个档位的通过数、边界值（正好 50 万字）和缺字段的条目都符合预期。
+2. 在调试页把筛选切到最严的档位，连续请求第 1、2、3 页，确认每页都非空、没有重复，并且第 2 页的起点接在第 1 页后面。
+3. 在应用里切换筛选，对比前后的条数和最小值；再把筛选切回“不限”，确认列表恢复原样。
+
 ### 详情 `detail`
 
 `fields` 与搜索相同，在整个响应上取值；不写 `url` 时请求书籍的 `bookUrl`。另有 `keep`，用来把值存进书籍，后续阶段通过 `book.vars.名称` 读取：
@@ -896,7 +998,7 @@ function videoContent(ctx) {
 }
 ```
 
-**图片解密 `imageDecode`** 用于图片本身被加密的漫画源。密钥和 IV 在取正文时算好，应用下载每张图片后用系统加密框架解密再显示：
+**图片解密 `imageDecode`** 用于图片本身被加密的书源，漫画图片和图文正文（`text`）里的 `<img>` 插图都适用。密钥和 IV 在取正文时算好，应用下载每张图片后用系统加密框架解密再显示：
 
 ```json
 "content": {
@@ -909,6 +1011,7 @@ function videoContent(ctx) {
 - `algorithm` 支持 AES 和 3DES 的 ECB、CBC、CTR、OFB、CFB 模式。`key`、`iv` 可以是文本（按 UTF-8）或字节。
 - `iv` 总是按表达式求值（没有 `ivEncoding`）：文本 IV 写 `"iv": "= '97b60394abc2fbe1'"`，16 个字符即 16 字节；十六进制 IV 写 `"iv": "= hexBytes('39376236303339346162633266626531')"`。不要把文本 IV 交给 `hexBytes`，`hexBytes('97b60394abc2fbe1')` 只得到 8 字节。
 - 一章里的图片共用同一组参数。下载到的内容本身已经是图片时不解密。
+- 图文正文里的插图：引擎把每个 `<img>` 改写成 `<img src="地址,{选项}">`，选项里带上解密参数和 `mediaHeaders`，书源不用自己往地址里拼选项。地址按 `data-original`、`data-src`、`data-url`、`data-lazy-src`、`data-echo`、`src`、`data-r-src` 的顺序取第一个有值的属性；其他属性名（如站点自定的 `data-image-zoom`）先在 `text` 规则里换到 `src`。已经带选项的地址、段评控件（`ident`、`onclick`）保持原样。正文里没有 `<img>` 时不求值密钥，纯文字章节不受密钥规则影响。
 - 不写 `keyEncoding` 时保留既有规则语义：固定文本须写成 `"key": "= '0123456789abcdef'"`，十六进制密钥可写成 `"key": "= hexBytes(d.key)"`。裸文本是选择器，不是密钥字面值；求值为空会明确报错。
 - 显式设置 `keyEncoding: "utf8"` 或 `"hex"` 后，`key` 接受字面文本、模板或表达式，并按指定编码转换。hex 必须是完整的十六进制字节。静态密钥在导入时校验长度，动态密钥在取正文时校验；AES 支持 16/24/32 字节，3DES 为 24 字节。
 - 只能做标准的对称解密。按规律打乱像素块这类自定义混淆做不了；文件格式特殊时用下面的字节脚本。
@@ -1042,9 +1145,9 @@ function restoreImage(bytes, ctx) {
   "when": "= vars.bubbles != '关'",
   "stats": { "url": "{{server}}/api/para/stats?chapter={{d.id}}" },
   "counts": "= stats.data.paras",
+  "hot": "= stats.data.hot",
   "paragraphUrl": "{{server}}/comment?chapter={{d.id}}&para={{para.index}}",
-  "chapterUrl": "{{server}}/comment?chapter={{d.id}}",
-  "max": 60
+  "chapterUrl": "{{server}}/comment?chapter={{d.id}}"
 }
 ```
 
@@ -1053,12 +1156,37 @@ function restoreImage(bytes, ctx) {
 | `when` | 为假时整个评论功能不生效，也不发统计请求 |
 | `stats` | 统计接口，结果绑定为 `stats` |
 | `counts` | 每段评论数：对象的键（或列表下标）是正文行号，值是条数。行号按 `text` 结果的换行切分，从 0 开始。写了 `paragraphUrl` 或 `page` 时必填 |
+| `hot` | 可选，每段热评。写成表达式时，结果的键（或列表下标）同 `counts`，值是评论文字，或 `{ "text": "…", "likes": "1.2k" }`；统计接口本身不带评论原文时写成对象按段请求，见下。只对有气泡的段落生效，参考宿主在开启热评卡片时把它画在段落下方，点卡片与点气泡打开同一个评论页；取值失败只是不显示卡片 |
+| `chapterHot` | 可选，本章说卡片上显示的一条热评。写法同 `hot`：表达式结果是文字或 `{ "text", "likes" }`；对象只发一个请求、没有 `top` 和 `para`。需要同时有 `chapterUrl` 或 `chapterPage` |
 | `paragraphUrl` | 段评页地址，可用 `para.index`、`para.count`、`para.text`（该段前 90 个字） |
 | `chapterUrl` | 整章评论页地址，可用 `total`（各段条数之和）。有值时章末显示「本章说」入口 |
 | `page`、`chapterPage` | 新增的内联段评／章评页面，见下；需宿主接入支持 |
-| `max` | 一章最多显示多少个气泡，默认 60，上限 300 |
+| `max` | 一章最多显示多少个气泡，默认 300，也是上限；想少显示时调小 |
 
 `paragraphUrl`、`chapterUrl`、`page`、`chapterPage` 至少写一个。统计接口失败时正文照常显示，只是没有气泡。评论只对文本正文生效。
+
+#### 按段请求热评
+
+统计接口只给条数时，`hot` 可以写成对象，在取正文时为评论最多的几段各取一条热评：
+
+```json
+"hot": {
+  "top": 6,
+  "request": { "url": "/api/comments?chapter={{chapter.index}}&paragraph={{para.index}}&size=1" },
+  "text": "= first(res.items).text",
+  "likes": "= first(res.items).likes"
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `when` | 可选，为假时不发热评请求，适合配合书源变量做开关 |
+| `top` | 取评论数最多的前几段，1 到 12，默认 6 |
+| `request` | 每段一个请求，可用 `para.index`、`para.count`、`para.text`；写法同 `stats` |
+| `text` | 热评文字，可用请求结果 `res` 和 `para`；结果为空的段落不显示卡片 |
+| `likes` | 可选，点赞数，原样显示 |
+
+`chapterHot` 写成对象时与这些请求同时发出。这些请求整体最多等 4 秒，到时没回来或失败的段落只显示气泡，不影响正文。每章多出 `top` 个请求，按站点能承受的频率设置；接口要求顺序或限流严格时调小 `top`。
 
 #### 内联评论页：点击后取数和生成 HTML
 
@@ -1173,7 +1301,7 @@ blockquote { background: #f3f3f3; }
 
 | 字段 | 语义 |
 | --- | --- |
-| `algorithm` | `AES/CBC/PKCS7Padding`，也接受同等填充的 `AES/CBC/PKCS5Padding` |
+| `algorithm` | `AES/CBC/PKCS7Padding`，也接受同等填充的 `AES/CBC/PKCS5Padding`；密文没有填充（长度正好是 16 的倍数、解开后末尾不去字节）时写 `AES/CBC/NoPadding` |
 | `key` | AES 密钥，解码后必须为 16、24 或 32 字节 |
 | `keyEncoding` | 默认 `hex`（严格十六进制），也支持 `utf8` |
 | `ivPrefixBytes` | 设为 `16` 时，文件前 16 字节是 IV，其余字节是 AES 密文 |
@@ -1625,7 +1753,7 @@ function verifyAndCheck(ctx) {
 
 #### Cookie、登录与“完成”
 
-- API 26 的默认 ArkWeb 存储适配器通过 `fetchCookieSync(url, false, true)` 读取目标 URL 的第一方分区 Cookie，用于原生文本/二进制 HTTP 和脚本 `cookie.get`；API 20–25 保留旧读取方式。自定义 `SourceCookieJar` 可提供 `getRequestCookie`，未提供时回退到 `getCookie`。
+- API 26 的默认 ArkWeb 存储适配器通过 `fetchCookieSync(url, false, true)` 读取目标 URL 的第一方分区 Cookie，用于原生文本/二进制 HTTP 和脚本 `cookie.get`；API 20–25 保留旧读取方式。自定义 `SourceCookieJar` 可提供 `getRequestCookie`，未提供时回退到 `getCookie`；也可提供 `removeCookieAsync`，退出登录（`NativeSourceService.logout`，异步）会优先用它在后台删除站点 Cookie，未提供时退回同步 `removeCookie`。默认 ArkWeb 存储的异步删除走 `fetchCookie` / `configCookie`，同步删除也改为先批量写入再统一回读，避免 Cookie 多的站点在界面线程上卡住。
 - 没有显式 Cookie 头时按现有规则自动使用存储中的匹配 Cookie；显式 Cookie 头仍优先，不自动补齐。通常应让存储负责发送，避免手工拼接旧值覆盖验证后会话。原有跨 origin 去凭据策略不变。
 - Cookie 复制路径仍不读取分区 Cookie；`cf_clearance`、`__cf_bm` 不跨地址复制。不要将挑战 Cookie 搬到镜像域，或把分区 Cookie 当成普通 Cookie 注入网页。
 - `cookie.remove` 清理目标地址的会话，不清空应用全局 Cookie。分区清理包含保留 Partitioned 属性的过期写入和短期墓碑兼容处理；当前设备验证仅覆盖测试域根路径，不能保证所有 Domain/Path 组合都已验收。
@@ -3332,7 +3460,7 @@ https://img.example/page.jpg,{"headers":{"Referer":"https://example.com/"}}
 登录动作使用独立 ArkWeb 运行环境，不会让搜索或正文自动改走登录页面。当前桥接包括：
 
 - `java.ajax` 的受控 HTTP 请求与逐步响应回填；
-- `source.variable`、`loginHeader`、`loginInfo`、`source.get/put` 和 `cache` 状态；
+- `source.variable`、`loginHeader`、`loginInfo`、`source.get/put` 和 `cache` 状态：任务开始时以宿主数据库里的值为准（库里登录头为空即视为已退出，不用页面持有的旧快照补回），任务结束只写回脚本自己改过的变量和登录头，改密码重新登录后不会被仍在运行的旧任务写回旧密钥；
 - Cookie 获取、设置、替换、按名称删除及网页 Cookie 回写；
 - Base64/Base64URL、Hex、URL/HTML 编解码、字节数组和 UUID；
 - `createSymmetricCrypto` 的 AES/DES/3DES 常见变换；
